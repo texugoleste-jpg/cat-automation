@@ -1,39 +1,44 @@
-name: 🐱 CSBuy Cat Bot
+name: 🐱 CSBuy Cat Bot v2
 
 on:
   schedule:
-    - cron: '0 * * * *'   # todo hora (coleta comida + alimenta)
-    - cron: '*/15 * * * *' # a cada 15 min (caça corações)
-  workflow_dispatch:        # permite rodar manualmente
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Salvar screenshots de debug?'
+        required: false
+        default: 'true'
 
 jobs:
-  run-bot:
+  cat-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
-      - name: Checkout
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: 📦 Instalar dependências
         run: |
           pip install playwright opencv-python-headless numpy pillow
           playwright install chromium --with-deps
 
-      - name: Run Cat Bot
+      - name: 🐱 Rodar bot
         env:
           CSSBUY_COOKIES: ${{ secrets.CSSBUY_COOKIES }}
         run: python bot.py
 
-      - name: Upload screenshot on failure
-        if: failure()
+      - name: 📸 Upload screenshots de debug
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshot
+          name: debug-${{ github.run_number }}
           path: screenshot_*.png
-          retention-days: 1
+          retention-days: 3
+          if-no-files-found: ignore
