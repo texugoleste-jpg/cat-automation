@@ -1,29 +1,40 @@
 """
-CSBuy Cat Game Bot
-- Faz login no CSBuy
-- Alimenta o gato
-- Detecta e clica nos corações (via visão computacional)
-- Coleta comida da máquina quando disponível
+CSBuy Cat Game Bot — v2
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Descobertas do vídeo de gameplay:
+  • O jogo é um POPUP na homepage (não URL separada)
+  • 4 ações por sessão: alimentar, corações, Collect (máquina), Daily Draw
+  • Corações são vermelhos sólidos dentro do popup
+  • Daily Draw dá +200g por dia
+  • Botão laranja "Collect" aparece quando máquina está pronta
+  • Viewport desktop (não mobile) — jogo roda no site desktop
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import asyncio
+import io
+import json
+import logging
 import os
 import sys
 import time
-import logging
-import numpy as np
+
 import cv2
+import numpy as np
 from PIL import Image
-import io
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# ── Config ──────────────────────────────────────────────────────────────────
-CSSBUY_URL   = "https://www.cssbuy.com"
-GAME_URL     = "https://www.cssbuy.com/pet"   # ⚠️ ajuste para a URL real do jogo
-COOKIES_JSON = os.environ["CSSBUY_COOKIES"]   # JSON exportado do browser
+# ── Config ────────────────────────────────────────────────────────────────────
+CSSBUY_URL     = "https://www.cssbuy.com"
+COOKIES_JSON   = os.environ["CSSBUY_COOKIES"]
 
-HEART_SCAN_DURATION = 5 * 60   # segundos caçando corações (5 min)
-HEART_SCAN_INTERVAL = 2        # segundos entre cada scan
+VIEWPORT_W     = 1280
+VIEWPORT_H     = 800
+
+HEART_DURATION = 4 * 60   # segundos caçando corações por execução
+HEART_INTERVAL = 1.5      # segundos entre cada scan
+
+FEED_TIMES     = 5        # quantas vezes alimenta por sessão
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,245 +44,438 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Detecção de corações via OpenCV ─────────────────────────────────────────
+# ── BBox helper ───────────────────────────────────────────────────────────────
 
-def detect_hearts(screenshot_bytes: bytes) -> list[tuple[int, int]]:
+class BBox:
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+
+    def contains(self, px, py, margin=10):
+        return (self.x - margin <= px <= self.x + self.w + margin and
+                self.y - margin <= py <= self.y + self.h + margin)
+
+    def __repr__(self):
+        return f"BBox(x={self.x:.0f}, y={self.y:.0f}, w={self.w:.0f}, h={self.h:.0f})"
+
+
+# ── Visão computacional ────────────────────────────────────────────────────────
+
+def _crop_to_bbox(img: np.ndarray, bbox: BBox | None):
+    if bbox is None:
+        return img, 0, 0
+    x1 = max(0, int(bbox.x))
+    y1 = max(0, int(bbox.y))
+    x2 = min(img.shape[1], int(bbox.x + bbox.w))
+    y2 = min(img.shape[0], int(bbox.y + bbox.h))
+    return img[y1:y2, x1:x2], x1, y1
+
+
+def detect_hearts(screenshot_bytes: bytes, bbox: BBox | None = None) -> list[tuple[int, int]]:
     """
-    Recebe screenshot em bytes, devolve lista de (x, y) com centros de corações detectados.
-    Corações no jogo são rosa/vermelho brilhante — filtramos por HSV.
+    Detecta corações vermelhos/rosa no screenshot.
+    Restringe a busca ao bbox do popup se fornecido.
+    Retorna lista de (x, y) em coordenadas absolutas da página.
     """
     img = np.array(Image.open(io.BytesIO(screenshot_bytes)))
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    roi, ox, oy = _crop_to_bbox(img, bbox)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
 
-    # Faixa de cor rosa/vermelho dos corações
-    # Ajuste lower/upper se necessário inspecionando a cor real
-    masks = []
-    for (lower, upper) in [
-        (np.array([0,   120, 120]), np.array([10,  255, 255])),   # vermelho 1
-        (np.array([160, 120, 120]), np.array([180, 255, 255])),   # vermelho 2
-        (np.array([140,  80, 120]), np.array([170, 255, 255])),   # rosa
-    ]:
-        masks.append(cv2.inRange(hsv, lower, upper))
+    ranges = [
+        (np.array([0,   150, 100]), np.array([10,  255, 255])),   # vermelho 1
+        (np.array([160, 150, 100]), np.array([180, 255, 255])),   # vermelho 2
+        (np.array([140,  80, 120]), np.array([165, 255, 255])),   # rosa
+    ]
+    mask = sum(cv2.inRange(hsv, lo, hi) for lo, hi in ranges)
 
-    mask = masks[0] | masks[1] | masks[2]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
-    # Remove ruído
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    # Encontra contornos
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     clicks = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 200 < area < 8000:      # filtra tamanho (~coração)
-            M  = cv2.moments(cnt)
+        if 150 < area < 10_000:
+            M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            clicks.append((cx, cy))
+            clicks.append((int(M["m10"] / M["m00"]) + ox,
+                            int(M["m01"] / M["m00"]) + oy))
 
-    log.info(f"Corações detectados: {len(clicks)} → {clicks}")
+    if clicks:
+        log.info(f"❤️  Corações detectados: {len(clicks)} → {clicks}")
     return clicks
 
 
-def save_debug_screenshot(screenshot_bytes: bytes, tag: str):
+def detect_orange_collect(screenshot_bytes: bytes, bbox: BBox | None = None) -> tuple[int, int] | None:
+    """
+    Detecta o botão laranja 'Collect' visualmente.
+    Retorna (x, y) do centro ou None.
+    """
+    img = np.array(Image.open(io.BytesIO(screenshot_bytes)))
+    roi, ox, oy = _crop_to_bbox(img, bbox)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+
+    mask = cv2.inRange(hsv, np.array([10, 180, 150]), np.array([25, 255, 255]))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 500 and area > best_area:
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            best = (int(M["m10"] / M["m00"]) + ox,
+                    int(M["m01"] / M["m00"]) + oy)
+            best_area = area
+
+    if best:
+        log.info(f"🟠 Botão Collect detectado em {best}")
+    return best
+
+
+def save_debug(screenshot_bytes: bytes, tag: str):
     path = f"screenshot_{tag}_{int(time.time())}.png"
     with open(path, "wb") as f:
         f.write(screenshot_bytes)
-    log.info(f"Screenshot salvo: {path}")
+    log.info(f"📸 {path}")
 
 
-# ── Helpers de página ────────────────────────────────────────────────────────
-
-async def safe_click(page, selector: str, timeout=5000) -> bool:
-    try:
-        await page.click(selector, timeout=timeout)
-        log.info(f"Clicou em: {selector}")
-        return True
-    except PlaywrightTimeout:
-        log.warning(f"Elemento não encontrado: {selector}")
-        return False
-
-
-async def get_game_frame(page):
-    """
-    O jogo pode estar dentro de um <iframe>.
-    Devolve o frame correto ou a própria page se não houver iframe.
-    """
-    frames = page.frames
-    for frame in frames:
-        url = frame.url
-        if "pet" in url or "game" in url or "turbolink" in url.lower():
-            log.info(f"Frame do jogo encontrado: {url}")
-            return frame
-    return page   # fallback: sem iframe
-
-
-# ── Ações do jogo ────────────────────────────────────────────────────────────
+# ── Login ──────────────────────────────────────────────────────────────────────
 
 async def do_login(context, page):
-    """
-    Injeta cookies salvos no GitHub Secret em vez de fazer login manual.
-    Evita CAPTCHA, 2FA e mudanças no formulário de login.
-    """
-    import json
     log.info("Injetando cookies…")
-
     cookies = json.loads(COOKIES_JSON)
-
-    # Garante que o domínio está presente em todos os cookies
     for c in cookies:
-        if "domain" not in c or not c["domain"]:
+        if not c.get("domain"):
             c["domain"] = ".cssbuy.com"
-
     await context.add_cookies(cookies)
-    log.info(f"{len(cookies)} cookies injetados.")
+    log.info(f"✅ {len(cookies)} cookies injetados.")
 
-    # Visita a home para validar sessão
     await page.goto(CSSBUY_URL, wait_until="networkidle")
+    await asyncio.sleep(2)
 
-    # Verifica se ainda está logado
     if "login" in page.url.lower():
-        raise RuntimeError("❌ Cookies expirados! Gere novos cookies com inspect_game.py")
-
+        raise RuntimeError("❌ Cookies expirados! Gere novos com inspect_game.py")
     log.info("Sessão válida ✓")
 
 
-async def navigate_to_game(page):
-    log.info(f"Navegando para o jogo: {GAME_URL}")
-    await page.goto(GAME_URL, wait_until="networkidle")
-    await asyncio.sleep(3)   # aguarda animações iniciais
+# ── Localizar popup ────────────────────────────────────────────────────────────
 
-
-async def feed_cat(frame):
-    """
-    Clica no ícone de alimentar (saco de ração 740g).
-    ⚠️ Ajuste o seletor conforme inspeção do DOM real.
-    """
-    log.info("Tentando alimentar o gato…")
+async def wait_for_popup(page, timeout=20) -> BBox | None:
+    """Espera o popup do jogo aparecer e retorna seu BBox."""
+    log.info("Aguardando popup do jogo…")
     selectors = [
-        ".feed-btn",
-        "[class*='feed']",
-        "[class*='food']",
-        "img[src*='food']",
-        "img[src*='bag']",
+        ".pet-game-modal", ".pet-game", ".cat-game", "#pet-game",
+        "[class*='pet'][class*='game']", "[class*='cat'][class*='game']",
+        ".game-modal", ".game-popup", "[class*='game-wrap']",
+        "[class*='turbo']", ".modal-content", ".modal.show .modal-body",
     ]
-    for sel in selectors:
-        if await safe_click(frame, sel, timeout=3000):
-            await asyncio.sleep(1)
-            return True
-    log.warning("Botão de alimentar não encontrado — verifique o seletor.")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    bb = await el.bounding_box()
+                    if bb and bb["width"] > 80 and bb["height"] > 150:
+                        bbox = BBox(bb["x"], bb["y"], bb["width"], bb["height"])
+                        log.info(f"✅ Popup via '{sel}': {bbox}")
+                        return bbox
+            except Exception:
+                pass
+        await asyncio.sleep(1)
+    log.warning("⚠️ Popup não detectado pelo DOM — sem restrição de área.")
+    return None
+
+
+async def click_cat_to_open_game(page) -> bool:
+    """
+    Clica no ícone do gato no canto superior esquerdo da homepage
+    para abrir o popup do jogo ("Grow me, win prizes!").
+    """
+    log.info("Procurando ícone do gato…")
+
+    cat_selectors = [
+        ":has-text('Grow me')",
+        ":has-text('win prizes')",
+        "img[src*='cat']",
+        "img[src*='pet']",
+        "img[src*='mascot']",
+        "[class*='pet-icon']",
+        "[class*='cat-icon']",
+        "[class*='mascot']",
+        "[class*='pet-entry']",
+        "[class*='game-entry']",
+        "[class*='grow']",
+    ]
+
+    for sel in cat_selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                await el.click()
+                log.info(f"✅ Gato clicado via '{sel}'")
+                await asyncio.sleep(2)
+                return True
+        except Exception:
+            pass
+
+    # Fallback por posição — gato fica em ~(85, 180) num viewport 1280x800
+    log.warning("Seletores não encontraram o gato — tentando posição aproximada…")
+    try:
+        await page.mouse.click(85, 180)
+        await asyncio.sleep(2)
+        save_debug(await page.screenshot(), "cat_click_fallback")
+        return True
+    except Exception as e:
+        log.error(f"Falha ao clicar no gato: {e}")
+        return False
+
+
+async def get_game_context(page):
+    """
+    1. Clica no gato para abrir o popup.
+    2. Retorna (ctx, bbox) — ctx é o frame do jogo ou a page.
+    """
+    await click_cat_to_open_game(page)
+
+    for frame in page.frames:
+        if any(k in frame.url for k in ["pet", "game", "turbo", "cat"]):
+            log.info(f"Iframe do jogo: {frame.url}")
+            for iframe_el in await page.query_selector_all("iframe"):
+                src = await iframe_el.get_attribute("src") or ""
+                if any(k in src for k in ["pet", "game", "turbo"]):
+                    bb = await iframe_el.bounding_box()
+                    if bb:
+                        return frame, BBox(bb["x"], bb["y"], bb["width"], bb["height"])
+            return frame, None
+
+    bbox = await wait_for_popup(page)
+    return page, bbox
+
+
+# ── Ações do jogo ─────────────────────────────────────────────────────────────
+
+async def safe_click(ctx, selector: str, timeout=4000) -> bool:
+    try:
+        await ctx.click(selector, timeout=timeout)
+        log.info(f"  ✓ {selector}")
+        await asyncio.sleep(0.5)
+        return True
+    except (PlaywrightTimeout, Exception):
+        return False
+
+
+async def close_overlay(ctx):
+    """Fecha qualquer overlay/popup secundário (Congrats, anúncio, etc.)."""
+    for sel in ["button.close", ".close-btn", "[class*='close']",
+                ".modal-close", ".congrats-close", ".reward-close",
+                "button[aria-label='Close']"]:
+        try:
+            el = await ctx.query_selector(sel)
+            if el and await el.is_visible():
+                await el.click()
+                log.info(f"Overlay fechado: {sel}")
+                await asyncio.sleep(0.8)
+                return True
+        except Exception:
+            pass
+    try:
+        await ctx.keyboard.press("Escape")
+    except Exception:
+        pass
     return False
 
 
-async def collect_food_machine(frame):
-    """
-    Coleta a comida produzida pela máquina (contador recarrega a cada 1h).
-    ⚠️ Ajuste o seletor conforme inspeção do DOM real.
-    """
-    log.info("Verificando máquina de comida…")
-    selectors = [
-        ".machine",
-        "[class*='machine']",
-        "[class*='production']",
-        "img[src*='machine']",
-    ]
-    for sel in selectors:
-        if await safe_click(frame, sel, timeout=3000):
-            await asyncio.sleep(1)
-            log.info("Comida coletada da máquina!")
+async def do_daily_draw(ctx) -> bool:
+    """Executa o Daily Fortune Draw (+200g observado no vídeo)."""
+    log.info("🎰 Daily Draw…")
+    opened = False
+    for sel in ["[class*='daily-draw']", "[class*='daily'][class*='draw']",
+                "img[src*='daily']", ".daily-draw", ":has-text('Daily Draw')"]:
+        if await safe_click(ctx, sel, timeout=3000):
+            opened = True
+            await asyncio.sleep(1.5)
+            break
+
+    if not opened:
+        log.warning("Daily Draw não encontrado.")
+        return False
+
+    for sel in ["button:has-text('Draw now')", "button:has-text('Draw')",
+                "[class*='draw-btn']", ".draw-now"]:
+        if await safe_click(ctx, sel, timeout=4000):
+            log.info("✅ Daily Draw feito!")
+            await asyncio.sleep(2)
+            await close_overlay(ctx)
             return True
-    log.warning("Máquina não encontrada — verifique o seletor.")
+
+    await close_overlay(ctx)
     return False
 
 
-async def hunt_hearts(page, frame, duration: int = HEART_SCAN_DURATION):
+async def do_blind_box(ctx) -> bool:
+    """Tenta abrir o Blind Box diário (canto direito do popup)."""
+    log.info("📦 Blind Box…")
+    for sel in ["[class*='blind-box']", "[class*='blindbox']",
+                "img[src*='blind']", ":has-text('Blind Box')", ".blind-box"]:
+        if await safe_click(ctx, sel, timeout=3000):
+            await asyncio.sleep(1.5)
+            await close_overlay(ctx)
+            log.info("✅ Blind Box aberto!")
+            return True
+    log.info("Blind Box indisponível.")
+    return False
+
+
+async def collect_machine(ctx) -> bool:
+    """Coleta ração da máquina quando o timer acabou."""
+    log.info("⚙️  Máquina de comida…")
+    for sel in ["[class*='collect']", "button:has-text('Collect')", ".collect-btn",
+                "[class*='machine']", "[class*='production']", "img[src*='machine']"]:
+        if await safe_click(ctx, sel, timeout=3000):
+            log.info("✅ Máquina coletada!")
+            await asyncio.sleep(1)
+            return True
+    log.info("Máquina ainda carregando.")
+    return False
+
+
+async def feed_cat(ctx, times: int = FEED_TIMES) -> int:
+    """Clica no saco de ração N vezes."""
+    log.info(f"🍖 Alimentando ({times}x)…")
+    selectors = [
+        "[class*='food'][class*='bag']", "[class*='feedbag']", "[class*='feed-bag']",
+        "img[src*='food_bag']", "img[src*='feedbag']", "img[src*='bag']",
+        ".feed-btn", "[class*='feed']", "button:has-text('Feed')",
+    ]
+    fed = 0
+    for _ in range(times):
+        for sel in selectors:
+            if await safe_click(ctx, sel, timeout=3000):
+                fed += 1
+                await asyncio.sleep(0.8)
+                break
+        await asyncio.sleep(0.4)
+
+    log.info(f"Alimentou {fed}/{times}x.")
+    return fed
+
+
+async def hunt_hearts(page, ctx, bbox: BBox | None) -> int:
     """
-    Durante `duration` segundos, tira screenshots e clica nos corações detectados.
+    Loop principal: caça corações por HEART_DURATION segundos.
+    A cada 30s também tenta detectar o botão Collect laranja visualmente.
     """
-    log.info(f"Iniciando caça aos corações por {duration}s…")
-    end_time = time.time() + duration
-    total_clicks = 0
+    log.info(f"🏹 Caçando corações por {HEART_DURATION // 60}min…")
+    end_time   = time.time() + HEART_DURATION
+    collect_cd = 0
+    total      = 0
 
     while time.time() < end_time:
-        screenshot = await page.screenshot()
-        hearts = detect_hearts(screenshot)
+        ss = await page.screenshot()
 
-        for (x, y) in hearts:
+        # Corações
+        for (x, y) in detect_hearts(ss, bbox):
             try:
                 await page.mouse.click(x, y)
-                total_clicks += 1
-                log.info(f"  ❤️  Coração clicado em ({x}, {y})")
-                await asyncio.sleep(0.3)
+                total += 1
+                await asyncio.sleep(0.25)
             except Exception as e:
-                log.warning(f"Erro ao clicar em ({x}, {y}): {e}")
+                log.warning(f"Erro clique coração ({x},{y}): {e}")
 
-        await asyncio.sleep(HEART_SCAN_INTERVAL)
+        # Botão Collect laranja (visual, a cada 30s)
+        if time.time() > collect_cd:
+            pos = detect_orange_collect(ss, bbox)
+            if pos:
+                try:
+                    await page.mouse.click(*pos)
+                    log.info("🟠 Collect clicado!")
+                    await asyncio.sleep(1)
+                except Exception:
+                    pass
+            collect_cd = time.time() + 30
 
-    log.info(f"Caça encerrada. Total de corações clicados: {total_clicks}")
-    return total_clicks
+        await asyncio.sleep(HEART_INTERVAL)
+
+    log.info(f"Total corações: {total}")
+    return total
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    log.info("=" * 50)
-    log.info("CSBuy Cat Bot iniciado")
-    log.info("=" * 50)
+    log.info("=" * 55)
+    log.info("  CSBuy Cat Bot v2")
+    log.info("=" * 55)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            viewport={"width": 390, "height": 844},   # simula iPhone 14
+            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
             user_agent=(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-            )
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="zh-CN",
         )
         page = await context.new_page()
 
         try:
-            # 1. Injetar cookies (login)
+            # 1. Login
             await do_login(context, page)
+            save_debug(await page.screenshot(), "01_login")
 
-            # 2. Ir para o jogo
-            await navigate_to_game(page)
+            # 2. Localizar popup / iframe
+            ctx, bbox = await get_game_context(page)
+            log.info(f"ctx={'iframe' if ctx != page else 'page'}, bbox={bbox}")
+            save_debug(await page.screenshot(), "02_popup")
 
-            # Salva screenshot inicial para debug
-            ss = await page.screenshot()
-            save_debug_screenshot(ss, "after_navigate")
+            # 3. Fechar overlays iniciais
+            await close_overlay(ctx)
+            await asyncio.sleep(1)
 
-            # 3. Obtém o frame correto (se houver iframe)
-            frame = await get_game_frame(page)
+            # 4. Daily Draw
+            await do_daily_draw(ctx)
+            await asyncio.sleep(1)
 
-            # 4. Alimentar o gato
-            await feed_cat(frame)
+            # 5. Blind Box
+            await do_blind_box(ctx)
+            await asyncio.sleep(1)
 
-            # 5. Coletar comida da máquina
-            await collect_food_machine(frame)
+            # 6. Coletar máquina
+            await collect_machine(ctx)
+            await asyncio.sleep(1)
 
-            # 6. Caçar corações
-            await hunt_hearts(page, frame)
+            # 7. Alimentar
+            await feed_cat(ctx, FEED_TIMES)
+            await asyncio.sleep(1)
+
+            # 8. Caçar corações (loop principal)
+            await hunt_hearts(page, ctx, bbox)
+
+            save_debug(await page.screenshot(), "03_final")
 
         except Exception as e:
-            log.error(f"Erro inesperado: {e}", exc_info=True)
+            log.error(f"💥 {e}", exc_info=True)
             try:
-                ss = await page.screenshot()
-                save_debug_screenshot(ss, "error")
-            except:
+                save_debug(await page.screenshot(), "error")
+            except Exception:
                 pass
             raise
 
         finally:
             await browser.close()
-            log.info("Browser fechado. Bot encerrado.")
+            log.info("Encerrado ✓")
 
 
 if __name__ == "__main__":
