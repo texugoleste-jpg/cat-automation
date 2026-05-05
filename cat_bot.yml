@@ -1,0 +1,39 @@
+name: 🐱 CSBuy Cat Bot
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # todo hora (coleta comida + alimenta)
+    - cron: '*/15 * * * *' # a cada 15 min (caça corações)
+  workflow_dispatch:        # permite rodar manualmente
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright opencv-python-headless numpy pillow
+          playwright install chromium --with-deps
+
+      - name: Run Cat Bot
+        env:
+          CSSBUY_COOKIES: ${{ secrets.CSSBUY_COOKIES }}
+        run: python bot.py
+
+      - name: Upload screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: screenshot_*.png
+          retention-days: 1
